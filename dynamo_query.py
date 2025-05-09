@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Descarga registros de DynamoDB y los guarda en CSV.
+Exporta una tabla DynamoDB a CSV con posibilidad de filtrar por fechas
+y ordenar por un atributo.
 
 Requisitos:
     pip install boto3
 
-Uso:
-  python dynamo_query.py --table QR_TRANSACTION
-  python dynamo_query.py --table MiTabla --start-date 2023-01-01 --end-date 2023-01-31
-  python dynamo_query.py --table MiTabla --stdout
+Ejemplos
+  python dynamo_query.py --table QR_TRANSACTION --sort-by created_date
+  python download_dynamodb_to_csv.py --table MiTabla --start-date 2023-01-01 \
+         --end-date 2023-01-31 --sort-by created_date --desc
 """
 
 import argparse
@@ -30,40 +31,73 @@ def parse_arguments() -> argparse.Namespace:
     p.add_argument("--start-date", help="Fecha inicio (YYYY-MM-DD o ISO 8601).")
     p.add_argument("--end-date", help="Fecha fin    (YYYY-MM-DD o ISO 8601).")
     p.add_argument("--date-attr", default="created_at",
-                   help="Campo fecha usado para filtrar (def: created_at).")
+                   help="Campo fecha usado en el filtro (def: created_at).")
     p.add_argument("--stdout", action="store_true",
-                   help="Imprime CSV en la salida estándar en vez de archivo.")
-    p.add_argument("--profile", help="Perfil AWS (opcional).")
-    p.add_argument("--region", help="Región AWS (opcional).")
-    p.add_argument("--delimiter", default=",",
-                   help="Delimitador CSV (def: ,).")
+                   help="Imprime el CSV en stdout en lugar de archivo.")
+    p.add_argument("--profile", help="Perfil AWS.")
+    p.add_argument("--region", help="Región AWS.")
+    p.add_argument("--delimiter", default=",", help="Delimitador CSV (def: ,).")
+
+    # ------------- NUEVO: ordenación ------------- #
+    p.add_argument("--sort-by", default="created_date",
+                   help="Nombre del atributo por el que ordenar (def: created_date).")
+    p.add_argument("--desc", action="store_true",
+                   help="Orden descendente si se indica.")
     return p.parse_args()
 
 
-# ------------------------- Utilidades ------------------------- #
+# ------------------------- Utilidades de fechas y tipos ------------------------- #
 def iso_to_timestamp_ms(date_str: str) -> int:
-    try:
-        dt = datetime.fromisoformat(date_str)
-    except ValueError as exc:
-        raise ValueError(f"Fecha inválida: {date_str}") from exc
+    dt = datetime.fromisoformat(date_str)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
 
 
-def to_scalar(value: Any) -> Any:
-    """Convierte Decimals y estructuras a formatos serializables en CSV."""
-    if isinstance(value, Decimal):
-        return int(value) if value % 1 == 0 else float(value)
-    # Para listas / mapas anidados devolvemos JSON compactado
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
-    return value
+def value_as_sort_key(val: Any) -> Any:
+    """
+    Convierte un valor a una clave comparable para la ordenación.
+    Maneja tipos numéricos y strings ISO de fecha.
+    """
+    # Decimal → int / float
+    if isinstance(val, Decimal):
+        val = int(val) if val % 1 == 0 else float(val)
+
+    # Ya es un número
+    if isinstance(val, (int, float)):
+        return val
+
+    # Cadena → intentar ISO 8601
+    if isinstance(val, str):
+        try:
+            dt = datetime.fromisoformat(val)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            pass  # no era fecha
+
+        # Probar si es número en string
+        try:
+            return float(val)
+        except ValueError:
+            pass
+
+    # Fallback: ordenar por la representación de texto
+    return str(val)
+
+
+def to_scalar(val: Any) -> Any:
+    """Prepara el valor para volcarlo en CSV."""
+    if isinstance(val, Decimal):
+        return int(val) if val % 1 == 0 else float(val)
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return val
 
 
 def get_dynamodb_resource(profile: Optional[str], region: Optional[str]):
-    session_kwargs = {"profile_name": profile} if profile else {}
-    session = boto3.Session(**session_kwargs)
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
     return session.resource("dynamodb", region_name=region) if region else session.resource("dynamodb")
 
 
@@ -73,21 +107,20 @@ def scan_table(
     date_attr: str,
     start_ts: Optional[int],
     end_ts: Optional[int],
-    dynamodb_resource
+    dynamodb
 ) -> List[Dict[str, Any]]:
-    table = dynamodb_resource.Table(table_name)
+    table = dynamodb.Table(table_name)
     scan_kwargs: Dict[str, Any] = {"ConsistentRead": False}
 
-    if start_ts is not None and end_ts is not None:
+    if start_ts and end_ts:
         scan_kwargs["FilterExpression"] = Attr(date_attr).between(start_ts, end_ts)
-    elif start_ts is not None:
+    elif start_ts:
         scan_kwargs["FilterExpression"] = Attr(date_attr).gte(start_ts)
-    elif end_ts is not None:
+    elif end_ts:
         scan_kwargs["FilterExpression"] = Attr(date_attr).lte(end_ts)
 
     items: List[Dict[str, Any]] = []
     last_key = None
-
     while True:
         if last_key:
             scan_kwargs["ExclusiveStartKey"] = last_key
@@ -101,7 +134,6 @@ def scan_table(
 
 # ------------------------- CSV helpers ------------------------- #
 def collect_headers(items: List[Dict[str, Any]]) -> List[str]:
-    """Devuelve la unión de todas las claves en orden alfabético."""
     cols: Set[str] = set()
     for it in items:
         cols.update(it.keys())
@@ -122,27 +154,34 @@ def write_csv(items: List[Dict[str, Any]], headers: List[str],
 def main() -> None:
     args = parse_arguments()
 
+    # Parseo de rango de fechas para el filtro
     start_ts = iso_to_timestamp_ms(args.start_date) if args.start_date else None
     end_ts   = iso_to_timestamp_ms(args.end_date)   if args.end_date   else None
 
     dynamodb = get_dynamodb_resource(args.profile, args.region)
 
     try:
-        data = scan_table(args.table, args.date_attr, start_ts, end_ts, dynamodb)
+        items = scan_table(args.table, args.date_attr, start_ts, end_ts, dynamodb)
     except dynamodb.meta.client.exceptions.ResourceNotFoundException:
         print(f"❌  La tabla «{args.table}» no existe.", file=sys.stderr)
         sys.exit(1)
 
-    headers = collect_headers(data)
+    # ---------------- Ordenación ---------------- #
+    sort_attr = args.sort_by
+    items.sort(
+        key=lambda it: value_as_sort_key(it.get(sort_attr)),
+        reverse=args.desc
+    )
 
+    # ---------------- Escritura CSV ------------- #
+    headers = collect_headers(items)
     if args.stdout:
-        # Escritura en stdout
-        write_csv(data, headers, args.delimiter, sys.stdout)
+        write_csv(items, headers, args.delimiter, sys.stdout)
     else:
         outfile = f"{args.table}.csv"
         with open(outfile, "w", newline='', encoding="utf-8") as f:
-            write_csv(data, headers, args.delimiter, f)
-        print(f"✅  {len(data)} ítems exportados a {outfile}")
+            write_csv(items, headers, args.delimiter, f)
+        print(f"✅  {len(items)} ítems exportados y ordenados por «{sort_attr}» en {outfile}")
 
 
 if __name__ == "__main__":

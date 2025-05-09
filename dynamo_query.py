@@ -7,6 +7,8 @@ Requisitos:
 Ejemplos
   python download_dynamodb_to_csv.py --table MiTabla --order asc
   python dynamo_query.py --table QR_TRANSACTION --order desc --sort-by created_date
+  python dynamo_query.py --table QR_TRANSACTION --order desc --sort-by created_date
+  python dynamo_query.py --table QR_CUSTOMER --order desc --sort-by created_date
 """
 
 import argparse
@@ -52,28 +54,45 @@ def iso_to_timestamp_ms(date_str: str) -> int:
 
 
 def value_as_sort_key(val: Any) -> Any:
-    """Convierte el valor a un tipo comparable para sort."""
+    """
+    Devuelve SIEMPRE una tupla (tipo, valor) para que la comparación
+    sea consistente y no se mezclen tipos incompatibles.
+        tipo 0: número/epoch
+        tipo 1: string
+        tipo 2: None
+    """
+    # None al final (tipo 2)
+    if val is None:
+        return (2, None)
+
+    # Decimal ➜ numérico
     if isinstance(val, Decimal):
         val = int(val) if val % 1 == 0 else float(val)
 
+    # Numérico (int/float)  ➜ tipo 0
     if isinstance(val, (int, float)):
-        return val
+        return (0, val)
 
+    # String: fecha ISO o número
     if isinstance(val, str):
-        # intentar fecha ISO
+        # fecha ISO
         try:
             dt = datetime.fromisoformat(val)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
+            return (0, dt.timestamp())        # tipo 0  ➜ numérico
         except ValueError:
             pass
-        # intentar número
+        # número
         try:
-            return float(val)
+            return (0, float(val))            # tipo 0  ➜ numérico
         except ValueError:
             pass
-    return str(val)
+        # cualquier otro string ➜ tipo 1
+        return (1, val)
+
+    # Último recurso: serializar a string (tipo 1)
+    return (1, str(val))
 
 
 def to_scalar(val: Any) -> Any:
@@ -155,6 +174,7 @@ def main() -> None:
 
     # Ordenar
     reverse = args.order == "desc"
+    #items.sort(key=lambda it: value_as_sort_key(it.get(args.sort_by)), reverse=reverse)
     items.sort(key=lambda it: value_as_sort_key(it.get(args.sort_by)), reverse=reverse)
 
     # CSV

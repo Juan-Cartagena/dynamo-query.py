@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Exporta una tabla DynamoDB a CSV con posibilidad de filtrar por fechas
-y ordenar por un atributo.
-
+Exporta una tabla DynamoDB a CSV con filtro de fechas y orden configurable.
 Requisitos:
     pip install boto3
 
 Ejemplos
-  python dynamo_query.py --table QR_TRANSACTION --sort-by created_date
-  python download_dynamodb_to_csv.py --table MiTabla --start-date 2023-01-01 \
-         --end-date 2023-01-31 --sort-by created_date --desc
+  python download_dynamodb_to_csv.py --table MiTabla --order asc
+  python dynamo_query.py --table QR_TRANSACTION --order desc --sort-by created_date
 """
 
 import argparse
@@ -31,22 +28,22 @@ def parse_arguments() -> argparse.Namespace:
     p.add_argument("--start-date", help="Fecha inicio (YYYY-MM-DD o ISO 8601).")
     p.add_argument("--end-date", help="Fecha fin    (YYYY-MM-DD o ISO 8601).")
     p.add_argument("--date-attr", default="created_at",
-                   help="Campo fecha usado en el filtro (def: created_at).")
+                   help="Atributo fecha usado en el filtro (def: created_at).")
     p.add_argument("--stdout", action="store_true",
-                   help="Imprime el CSV en stdout en lugar de archivo.")
+                   help="Imprime CSV en stdout en vez de archivo.")
     p.add_argument("--profile", help="Perfil AWS.")
     p.add_argument("--region", help="Región AWS.")
     p.add_argument("--delimiter", default=",", help="Delimitador CSV (def: ,).")
 
-    # ------------- NUEVO: ordenación ------------- #
+    # Ordenación
     p.add_argument("--sort-by", default="created_date",
-                   help="Nombre del atributo por el que ordenar (def: created_date).")
-    p.add_argument("--desc", action="store_true",
-                   help="Orden descendente si se indica.")
+                   help="Atributo por el que ordenar (def: created_date).")
+    p.add_argument("--order", choices=["asc", "desc"], default="asc",
+                   help="Orden asc o desc (def: asc).")
     return p.parse_args()
 
 
-# ------------------------- Utilidades de fechas y tipos ------------------------- #
+# ------------------------- Utilidades ------------------------- #
 def iso_to_timestamp_ms(date_str: str) -> int:
     dt = datetime.fromisoformat(date_str)
     if dt.tzinfo is None:
@@ -55,40 +52,31 @@ def iso_to_timestamp_ms(date_str: str) -> int:
 
 
 def value_as_sort_key(val: Any) -> Any:
-    """
-    Convierte un valor a una clave comparable para la ordenación.
-    Maneja tipos numéricos y strings ISO de fecha.
-    """
-    # Decimal → int / float
+    """Convierte el valor a un tipo comparable para sort."""
     if isinstance(val, Decimal):
         val = int(val) if val % 1 == 0 else float(val)
 
-    # Ya es un número
     if isinstance(val, (int, float)):
         return val
 
-    # Cadena → intentar ISO 8601
     if isinstance(val, str):
+        # intentar fecha ISO
         try:
             dt = datetime.fromisoformat(val)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.timestamp()
         except ValueError:
-            pass  # no era fecha
-
-        # Probar si es número en string
+            pass
+        # intentar número
         try:
             return float(val)
         except ValueError:
             pass
-
-    # Fallback: ordenar por la representación de texto
     return str(val)
 
 
 def to_scalar(val: Any) -> Any:
-    """Prepara el valor para volcarlo en CSV."""
     if isinstance(val, Decimal):
         return int(val) if val % 1 == 0 else float(val)
     if isinstance(val, (dict, list)):
@@ -154,7 +142,6 @@ def write_csv(items: List[Dict[str, Any]], headers: List[str],
 def main() -> None:
     args = parse_arguments()
 
-    # Parseo de rango de fechas para el filtro
     start_ts = iso_to_timestamp_ms(args.start_date) if args.start_date else None
     end_ts   = iso_to_timestamp_ms(args.end_date)   if args.end_date   else None
 
@@ -166,14 +153,11 @@ def main() -> None:
         print(f"❌  La tabla «{args.table}» no existe.", file=sys.stderr)
         sys.exit(1)
 
-    # ---------------- Ordenación ---------------- #
-    sort_attr = args.sort_by
-    items.sort(
-        key=lambda it: value_as_sort_key(it.get(sort_attr)),
-        reverse=args.desc
-    )
+    # Ordenar
+    reverse = args.order == "desc"
+    items.sort(key=lambda it: value_as_sort_key(it.get(args.sort_by)), reverse=reverse)
 
-    # ---------------- Escritura CSV ------------- #
+    # CSV
     headers = collect_headers(items)
     if args.stdout:
         write_csv(items, headers, args.delimiter, sys.stdout)
@@ -181,7 +165,7 @@ def main() -> None:
         outfile = f"{args.table}.csv"
         with open(outfile, "w", newline='', encoding="utf-8") as f:
             write_csv(items, headers, args.delimiter, f)
-        print(f"✅  {len(items)} ítems exportados y ordenados por «{sort_attr}» en {outfile}")
+        print(f"✅  {len(items)} ítems exportados en {outfile} (orden {args.order}).")
 
 
 if __name__ == "__main__":
